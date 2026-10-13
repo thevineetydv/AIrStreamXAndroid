@@ -29,11 +29,16 @@ android {
       keyAlias = "upload"
       keyPassword = System.getenv("KEY_PASSWORD")
     }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+    // debug.keystore is gitignored, so a fresh clone doesn't have it. Only use the
+    // shared debug keystore when it exists; otherwise fall back to the SDK's
+    // auto-generated ~/.android/debug.keystore (AGP's default debug signing).
+    if (file("${rootDir}/debug.keystore").exists()) {
+      create("debugConfig") {
+        storeFile = file("${rootDir}/debug.keystore")
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      }
     }
   }
 
@@ -45,7 +50,7 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      signingConfig = signingConfigs.getByName("debugConfig")
+      signingConfigs.findByName("debugConfig")?.let { signingConfig = it }
     }
   }
   compileOptions {
