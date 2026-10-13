@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Stylized background streaming waves / X shape in low opacity red/white -->
+    <path
+        android:strokeColor="#33FF5A5F"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M24,24 L84,84" />
+    <path
+        android:strokeColor="#33FF5A5F"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M84,24 L24,84" />
+
+    <!-- High-tech concentric streaming circles/rings -->
+    <path
+        android:strokeColor="#1AFF5A5F"
+        android:strokeWidth="6"
+        android:pathData="M54,18 A36,36 0 1,1 53.9,18" />
+    <path
+        android:strokeColor="#4DFF5A5F"
+        android:strokeWidth="2.5"
+        android:pathData="M54,26 A28,28 0 1,1 53.9,26" />
+
+    <!-- The main Red Play Button in the center -->
+    <path
+        android:fillColor="#FF5A5F"
+        android:pathData="M44,35 C44,33.5 45.8,32.5 47.1,33.3 L72.1,49.3 C73.3,50.1 73.3,51.9 72.1,52.7 L47.1,68.7 C45.8,69.5 44,68.5 44,67 Z" />
+
+    <!-- A glossy/highlight curve at the top edge of the play button for premium volume -->
+    <path
+        android:fillColor="#33FFFFFF"
+        android:pathData="M44,35 C44,33.5 45.8,32.5 47.1,33.3 L72.1,49.3 C65,49 52,43 44,35 Z" />
+
+    <!-- Stylized wave indicator in white representing stream -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M30,54 A24,24 0 0,1 33,40" />
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M78,54 A24,24 0 0,0 75,40" />
+
+</vector>

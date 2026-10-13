@@ -1,0 +1,6 @@
+{
+  "name": "AirStreamX",
+  "description": "Premium video streaming platform with HLS video player, TikTok-style vertical shorts, channels, search, channel subscription, and direct UPI creator tipping — no subscriber minimum.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

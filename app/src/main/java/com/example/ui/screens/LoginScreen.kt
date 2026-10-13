@@ -1,0 +1,521 @@
+package com.example.ui.screens
+
+import android.app.Activity
+import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.outlined.Person
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
+import com.example.player.MiniPlayerManager
+import com.example.ui.viewmodel.MainViewModel
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
+
+@Composable
+fun LoginScreen(
+    viewModel: MainViewModel,
+    onLoginSuccess: () -> Unit
+) {
+    val context = LocalContext.current
+    val view = LocalView.current
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var displayName by remember { mutableStateOf("") }
+    var isSignUp by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isLoading by remember { mutableStateOf(false) }
+
+    // Ensure edge-to-edge light status bar icons
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as? Activity)?.window
+            if (window != null) {
+                val controller = WindowCompat.getInsetsController(window, view)
+                controller.isAppearanceLightStatusBars = false
+            }
+        }
+    }
+
+    // Configure Google Sign-In options
+    val googleSignInClient = remember {
+        val webClientId = try {
+            context.getString(com.example.R.string.default_web_client_id)
+        } catch (e: Exception) {
+            "64626871662-7urcsqvoc08hp6omp5ikbk9fq6npij9c.apps.googleusercontent.com"
+        }
+        val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestIdToken(webClientId)
+            .requestEmail()
+            .requestProfile()
+            .build()
+        GoogleSignIn.getClient(context, gso)
+    }
+
+    // Google Sign-In Activity result callback
+    val googleSignInLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+        try {
+            val account = task.getResult(ApiException::class.java)
+            if (account != null) {
+                val userEmail = account.email ?: ""
+                val userName = account.displayName ?: userEmail.substringBefore("@")
+                val photoUrl = account.photoUrl?.toString()
+                val idToken = account.idToken
+
+                MiniPlayerManager.releasePlayer()
+                viewModel.clearActiveVideo()
+                viewModel.signInWithGoogle(
+                    idToken = idToken,
+                    email = userEmail,
+                    displayName = userName,
+                    photoUrl = photoUrl,
+                    onSuccess = {
+                        isLoading = false
+                        onLoginSuccess()
+                    },
+                    onError = { err ->
+                        isLoading = false
+                        errorMessage = err
+                    }
+                )
+            } else {
+                isLoading = false
+                errorMessage = "Failed to retrieve Google Account profile info."
+            }
+        } catch (e: Exception) {
+            Log.e("LoginScreen", "Google Sign-In failed", e)
+            isLoading = false
+            errorMessage = "Google login cancelled or connection error: " + (e.localizedMessage ?: e.message ?: "unknown")
+        }
+    }
+
+    // Slowly pulsing dark red glow effect at the top
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse_glow")
+    val glowProgress by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 4000, easing = EaseInOutSine),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "glow_progress"
+    )
+
+    // Derived pulsing properties
+    val animatedGlowAlpha = 0.10f + (glowProgress * 0.18f)
+    val animatedGlowHeight = (280 + (glowProgress * 100)).dp
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0A0A))
+            .testTag("login_screen")
+    ) {
+        // Subtle animated pulsing gradient background glow at the top
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(animatedGlowHeight)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0xFFFF5A5F).copy(alpha = animatedGlowAlpha),
+                            Color.Transparent
+                        )
+                    )
+                )
+        )
+
+        val scrollState = rememberScrollState()
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .imePadding()
+                .verticalScroll(scrollState)
+                .padding(horizontal = 24.dp, vertical = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Top
+        ) {
+            Spacer(modifier = Modifier.height(36.dp))
+
+            // Brand Logo / Icon with premium neon glow
+            Box(
+                modifier = Modifier
+                    .shadow(
+                        elevation = 16.dp,
+                        shape = RoundedCornerShape(16.dp),
+                        clip = false,
+                        ambientColor = Color(0xFFFF5A5F),
+                        spotColor = Color(0xFFFF5A5F)
+                    )
+                    .size(64.dp)
+                    .background(Color.Black, shape = RoundedCornerShape(16.dp))
+                    .border(2.dp, Color(0xFFFF5A5F), RoundedCornerShape(16.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                    modifier = Modifier.padding(horizontal = 6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "AirStreamX Logo",
+                        tint = Color(0xFFFF5A5F),
+                        modifier = Modifier.size(32.dp)
+                    )
+                    Spacer(modifier = Modifier.width(2.dp))
+                    Box(
+                        modifier = Modifier
+                            .width(3.dp)
+                            .height(20.dp)
+                            .background(Color.White)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Brand Title
+            Text(
+                text = buildAnnotatedString {
+                    withStyle(style = SpanStyle(color = Color.White, fontWeight = FontWeight.Bold)) {
+                        append("Air")
+                    }
+                    withStyle(style = SpanStyle(color = Color(0xFFFF5A5F), fontWeight = FontWeight.ExtraBold)) {
+                        append("StreamX")
+                    }
+                },
+                fontSize = 32.sp,
+                letterSpacing = (-0.5).sp
+            )
+
+            Spacer(modifier = Modifier.height(36.dp))
+
+            // Box enclosure for inputs representing modern design
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = Color.White.copy(alpha = 0.04f)
+                ),
+                shape = RoundedCornerShape(24.dp),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = if (isSignUp) "Create Account" else "Welcome Back",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Start
+                    )
+
+                    Spacer(modifier = Modifier.height(20.dp))
+
+                    if (isSignUp) {
+                        OutlinedTextField(
+                            value = displayName,
+                            onValueChange = { displayName = it },
+                            label = { Text("Display Name") },
+                            leadingIcon = { Icon(Icons.Default.Person, contentDescription = null) },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFFFF5A5F),
+                                unfocusedBorderColor = Color(0xFF2E2E2E),
+                                focusedLabelColor = Color(0xFFFF5A5F),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedLeadingIconColor = Color(0xFFFF5A5F),
+                                unfocusedLeadingIconColor = Color.White.copy(alpha = 0.4f)
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("username_input")
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                    }
+
+                    OutlinedTextField(
+                        value = email,
+                        onValueChange = { email = it },
+                        label = { Text("Email Address") },
+                        leadingIcon = { Icon(Icons.Default.Email, contentDescription = null) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFFFF5A5F),
+                            unfocusedBorderColor = Color(0xFF2E2E2E),
+                            focusedLabelColor = Color(0xFFFF5A5F),
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedLeadingIconColor = Color(0xFFFF5A5F),
+                            unfocusedLeadingIconColor = Color.White.copy(alpha = 0.4f)
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("email_input")
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = { Text("Password") },
+                        leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFFFF5A5F),
+                            unfocusedBorderColor = Color(0xFF2E2E2E),
+                            focusedLabelColor = Color(0xFFFF5A5F),
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedLeadingIconColor = Color(0xFFFF5A5F),
+                            unfocusedLeadingIconColor = Color.White.copy(alpha = 0.4f)
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("password_input")
+                    )
+
+                    errorMessage?.let {
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = it,
+                            color = Color(0xFFEF4444),
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    Button(
+                        onClick = {
+                            if (email.isBlank() || password.length < 6) {
+                                errorMessage = "Password must be at least 6 characters"
+                                return@Button
+                            }
+                            isLoading = true
+                            errorMessage = null
+                            MiniPlayerManager.releasePlayer()
+                            viewModel.clearActiveVideo()
+                            viewModel.signIn(
+                                email = email.trim(),
+                                displayName = if (isSignUp) displayName.trim() else null,
+                                pass = password,
+                                isSignUp = isSignUp,
+                                onSuccess = {
+                                    isLoading = false
+                                    onLoginSuccess()
+                                },
+                                onError = { err ->
+                                    isLoading = false
+                                    errorMessage = err
+                                }
+                            )
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5A5F)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("submit_button")
+                    ) {
+                        if (isLoading) {
+                            CircularProgressIndicator(color = Color.White, modifier = Modifier.size(24.dp))
+                        } else {
+                            Text(
+                                text = if (isSignUp) "Sign Up" else "Sign In",
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    TextButton(
+                        onClick = {
+                            isSignUp = !isSignUp
+                            errorMessage = null
+                        }
+                    ) {
+                        Text(
+                            text = if (isSignUp) "Already have an account? Sign In" else "Don't have an account? Sign Up",
+                            color = Color(0xFFA0A0A0)
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Elegant Divider: ─────────── OR ───────────
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                HorizontalDivider(
+                    modifier = Modifier.weight(1f),
+                    color = Color.White.copy(alpha = 0.15f),
+                    thickness = 1.dp
+                )
+                Text(
+                    text = "OR",
+                    color = Color.White.copy(alpha = 0.5f),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+                HorizontalDivider(
+                    modifier = Modifier.weight(1f),
+                    color = Color.White.copy(alpha = 0.15f),
+                    thickness = 1.dp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // Styled Google Sign In Button
+            OutlinedButton(
+                onClick = {
+                    isLoading = true
+                    errorMessage = null
+                    try {
+                        googleSignInLauncher.launch(googleSignInClient.signInIntent)
+                    } catch (e: Exception) {
+                        Log.e("LoginScreen", "Failed launching Google Sign-In intent", e)
+                        isLoading = false
+                        errorMessage = "Failed to launch Google Sign-In"
+                    }
+                },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .padding(horizontal = 8.dp)
+                    .testTag("google_auth_button")
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = "Continue with Google",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Continue as Guest Button
+            OutlinedButton(
+                onClick = {
+                    isLoading = true
+                    errorMessage = null
+                    MiniPlayerManager.releasePlayer()
+                    viewModel.clearActiveVideo()
+                    viewModel.signInAnonymously(
+                        onSuccess = {
+                            isLoading = false
+                            onLoginSuccess()
+                        },
+                        onError = { err ->
+                            isLoading = false
+                            errorMessage = err
+                        }
+                    )
+                },
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = Color.White
+                ),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .padding(horizontal = 8.dp)
+                    .testTag("guest_login_button")
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Person,
+                        contentDescription = "Guest Outline",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Continue as Guest",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White
+                    )
+                }
+            }
+        }
+    }
+}
