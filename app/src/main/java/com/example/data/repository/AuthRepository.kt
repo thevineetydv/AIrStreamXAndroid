@@ -86,7 +86,7 @@ class AuthRepository(private val context: Context) {
     init {
         // Sessions from the old Firebase-anonymous guest flow are dropped; guests
         // are now account-less (see guestMode).
-        if (firebaseAuth?.currentUser?.isAnonymous == true) firebaseAuth.signOut()
+        if (firebaseAuth?.currentUser?.isAnonymous == true) firebaseAuth?.signOut()
         firebaseAuth?.addAuthStateListener(authListener)
         if (firebaseAuth == null) {
             Log.e(TAG, "Firebase is not configured — add app/google-services.json. Sign-in is disabled.")
