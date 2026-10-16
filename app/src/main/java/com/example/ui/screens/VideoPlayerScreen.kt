@@ -42,6 +42,7 @@ import coil.compose.AsyncImage
 import androidx.media3.exoplayer.ExoPlayer
 import com.example.data.network.Video
 import com.example.player.MiniPlayerManager
+import com.example.ui.viewmodel.ActiveVideoError
 import com.example.ui.viewmodel.FeedUiState
 import com.example.ui.viewmodel.MainViewModel
 
@@ -55,9 +56,21 @@ fun VideoPlayerScreen(
 ) {
     val currentVideo by viewModel.currentActiveVideo.collectAsState()
     val feedState by viewModel.feedState.collectAsState()
+    val activeError by viewModel.activeVideoError.collectAsState()
     val playerContext = LocalContext.current
 
-    val video = currentVideo ?: return
+    val video = currentVideo
+    if (video == null || activeError == ActiveVideoError.NotFound) {
+        // Loading a video we only know the id of, or the server said 404
+        // ("Video not found" — also returned for other people's private videos).
+        BackHandler { onBackClick() }
+        PlayerStatusScreen(
+            error = activeError,
+            onBackClick = onBackClick,
+            onRetry = { viewModel.retryActiveVideo() }
+        )
+        return
+    }
 
     // MINI PLAYER hand-off: HlsVideoPlayer reports its live ExoPlayer here via
     // onPlayerReady so the back-button handler below can read the exact
@@ -159,26 +172,32 @@ fun VideoPlayerScreen(
                 .aspectRatio(16f / 9f)
         }
 
-        HlsVideoPlayer(
-            videoUrl = video.url,
-            modifier = playerModifier,
-            playWhenReady = true,
-            showControls = true,
-            isFullscreen = isFullscreen,
-            onFullscreenToggle = { isFullscreen = !isFullscreen },
-            onBackClick = {
-                if (isFullscreen) {
-                    isFullscreen = false
-                } else {
-                    handleBackOrMinimize()
-                }
-            },
-            onNextClick = onNextClick,
-            onPreviousClick = onPreviousClick,
-            nextVideoUrl = nextVideo?.url,
-            posterUrl = video.thumbnail,
-            onPlayerReady = { liveExoPlayer = it }
-        )
+        if (video.isPlayable()) {
+            HlsVideoPlayer(
+                videoUrl = video.url,
+                modifier = playerModifier,
+                playWhenReady = true,
+                showControls = true,
+                isFullscreen = isFullscreen,
+                onFullscreenToggle = { isFullscreen = !isFullscreen },
+                onBackClick = {
+                    if (isFullscreen) {
+                        isFullscreen = false
+                    } else {
+                        handleBackOrMinimize()
+                    }
+                },
+                onNextClick = onNextClick,
+                onPreviousClick = onPreviousClick,
+                nextVideoUrl = nextVideo?.takeIf { it.isPlayable() }?.url,
+                posterUrl = video.thumbnail,
+                onPlayerReady = { liveExoPlayer = it }
+            )
+        } else {
+            // status != "ready" (still transcoding) — don't hand a missing/partial
+            // stream to the player.
+            ProcessingPlaceholder(thumbnailUrl = video.thumbnail, modifier = playerModifier)
+        }
 
         if (!isFullscreen) {
             // Scrollable content below the player
@@ -254,7 +273,7 @@ fun VideoPlayerScreen(
                                         action = Intent.ACTION_SEND
                                         putExtra(
                                             Intent.EXTRA_TEXT,
-                                            "Watch ${video.title} on AirStreamX\nhttps://airstreamx.com/v/${video.publicId}"
+                                            "Watch ${video.title} on AirStreamX\n${video.shareUrl()}"
                                         )
                                         type = "text/plain"
                                     }
@@ -491,90 +510,6 @@ fun EngagementPill(icon: androidx.compose.ui.graphics.vector.ImageVector, label:
             maxLines = 1,
             softWrap = false,
             overflow = TextOverflow.Clip
-        )
-    }
-}
-
-// ── Tip Card ─────────────────────────────────────────────────────────────────
-@Composable
-fun TipCard(video: Video) {
-    val context = LocalContext.current
-    val presetAmounts = listOf(10, 29, 49, 99)
-    var selectedAmount by remember { mutableStateOf(49) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFFFF5A5F).copy(alpha = 0.08f), RoundedCornerShape(12.dp))
-            .border(1.dp, Color(0xFFFF5A5F).copy(alpha = 0.25f), RoundedCornerShape(12.dp))
-            .padding(14.dp)
-            .testTag("tip_card_${video.publicId}")
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                "Tip ${video.channelName} directly",
-                fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.White
-            )
-            Box(
-                modifier = Modifier.background(Color.White.copy(alpha = 0.1f), RoundedCornerShape(4.dp))
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            ) {
-                Text("UPI", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White.copy(alpha = 0.7f))
-            }
-        }
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Straight to their bank. No subscriber minimum, no ad share.",
-            fontSize = 12.sp, color = Color.Gray, lineHeight = 16.sp
-        )
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            presetAmounts.forEach { amount ->
-                val isSelected = selectedAmount == amount
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .background(
-                            if (isSelected) Color(0xFFFF5A5F) else Color.White.copy(alpha = 0.06f),
-                            RoundedCornerShape(8.dp)
-                        )
-                        .clickable { selectedAmount = amount }
-                        .padding(vertical = 10.dp)
-                        .testTag("tip_amount_${amount}"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        "₹$amount", fontSize = 14.sp, fontWeight = FontWeight.Bold,
-                        color = if (isSelected) Color.White else Color(0xFFA0A0A0)
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.height(12.dp))
-        Button(
-            onClick = {
-                // Real UPI-intent launch happens here — placeholder toast for now,
-                // matching the existing "coming soon" pattern used elsewhere in this app.
-                android.widget.Toast.makeText(
-                    context, "Opening UPI apps to send ₹$selectedAmount…", android.widget.Toast.LENGTH_SHORT
-                ).show()
-            },
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5A5F)),
-            shape = RoundedCornerShape(10.dp),
-            modifier = Modifier.fillMaxWidth().height(46.dp).testTag("send_tip_button")
-        ) {
-            Text("Send ₹$selectedAmount via UPI", fontWeight = FontWeight.Bold, color = Color.White)
-        }
-        Spacer(Modifier.height(10.dp))
-        Text(
-            "318 people tipped this week",
-            fontSize = 11.sp, color = Color.Gray,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center
         )
     }
 }

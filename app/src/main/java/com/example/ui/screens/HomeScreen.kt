@@ -39,8 +39,11 @@ import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import coil.request.CachePolicy
 import com.example.data.network.Video
+import androidx.compose.foundation.lazy.rememberLazyListState
 import com.example.ui.viewmodel.FeedUiState
 import com.example.ui.viewmodel.MainViewModel
+import com.example.ui.viewmodel.ShortsUiState
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
  
 @OptIn(ExperimentalMaterial3Api::class)
@@ -54,6 +57,7 @@ fun HomeScreen(
     onProfileClick: () -> Unit = {}
 ) {
     val feedState by viewModel.feedState.collectAsState()
+    val shortsState by viewModel.shortsState.collectAsState()
     val activeTag = remember { mutableStateOf("All") }
 val categories by viewModel.categories.collectAsState()
 
@@ -262,15 +266,28 @@ val categories by viewModel.categories.collectAsState()
                             it.channelName.contains(activeTag.value, ignoreCase = true)
                         }.ifEmpty { state.videos }
  
-                        val regularVideos = displayVideos.filter { it.duration > 60.0 }
-                        val shortsVideos   = displayVideos.filter { it.duration <= 60.0 }
- 
-                        if (displayVideos.isEmpty()) {
-                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                Text("No videos available", color = Color.Gray)
+                        // The feed is long videos only (type=long); Shorts come from their own request.
+                        val regularVideos = displayVideos
+                        val shortsVideos = (shortsState as? ShortsUiState.Success)?.videos.orEmpty()
+
+                        // Infinite scroll: ask for the next page when within 5 items of the end.
+                        val listState = rememberLazyListState()
+                        // Re-keyed on size so a short page that still fits the screen keeps loading.
+                        LaunchedEffect(listState, state.hasMore, state.videos.size) {
+                            snapshotFlow {
+                                val info = listState.layoutInfo
+                                val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+                                info.totalItemsCount > 0 && last >= info.totalItemsCount - 5
+                            }.distinctUntilChanged().collect { nearEnd ->
+                                if (nearEnd) viewModel.loadMoreHomeFeed()
                             }
+                        }
+
+                        if (displayVideos.isEmpty()) {
+                            // A genuinely empty (successful) response — errors have their own state.
+                            HomeEmptyState(onRetry = { viewModel.loadHomeFeed(forceRefresh = true) })
                         } else {
-                            LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 80.dp)) {
+                            LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 80.dp)) {
                                 // Trending hero — the single most-viewed video from this feed,
                                 // shown as a large featured card above everything else.
                                 val heroVideo = displayVideos.maxByOrNull { it.views }
@@ -288,7 +305,7 @@ val categories by viewModel.categories.collectAsState()
                                 var shortsInserted = false
  
                                 chunks.forEachIndexed { index, chunk ->
-                                    items(chunk) { video ->
+                                    items(chunk, key = { it.publicId }) { video ->
                                         RegularVideoCard(
                                             video = video,
                                             onClick = { onVideoClick(video) },
@@ -315,6 +332,28 @@ val categories by viewModel.categories.collectAsState()
                                         )
                                     }
                                 }
+                                // Paging footer: spinner while loading, Retry if the next page failed.
+                                if (state.isLoadingMore) {
+                                    item(key = "feed_loading_more") {
+                                        Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                            CircularProgressIndicator(color = Color(0xFFFF5A5F), modifier = Modifier.size(24.dp))
+                                        }
+                                    }
+                                } else if (state.loadMoreError != null) {
+                                    item(key = "feed_load_more_error") {
+                                        Column(
+                                            Modifier.fillMaxWidth().padding(16.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally
+                                        ) {
+                                            Text(state.loadMoreError, color = Color.Gray, fontSize = 13.sp, textAlign = TextAlign.Center)
+                                            Spacer(Modifier.height(8.dp))
+                                            Button(
+                                                onClick = { viewModel.loadMoreHomeFeed() },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5A5F))
+                                            ) { Text("Retry", color = Color.White) }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -331,7 +370,7 @@ val categories by viewModel.categories.collectAsState()
                             Spacer(Modifier.height(8.dp))
                             Text(state.message, color = Color.Gray, fontSize = 13.sp, textAlign = TextAlign.Center)
                             Spacer(Modifier.height(20.dp))
-                            Button(onClick = { viewModel.loadHomeFeed() },
+                            Button(onClick = { viewModel.loadHomeFeed(forceRefresh = true) },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5A5F))) {
                                 Text("Retry", color = Color.White)
                             }
@@ -647,7 +686,7 @@ fun VideoMenuBottomSheet(video: Video, onDismiss: () -> Unit) {
                     // Real Android share sheet
                     val i = Intent(Intent.ACTION_SEND).apply {
                         type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, "Watch \"${video.title}\" on AirStreamX: https://airstreamx.com/v/${video.publicId}")
+                        putExtra(Intent.EXTRA_TEXT, "Watch \"${video.title}\" on AirStreamX: ${video.shareUrl()}")
                     }
                     context.startActivity(Intent.createChooser(i, "Share via"))
                     onDismiss()

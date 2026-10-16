@@ -164,18 +164,11 @@ fun ChannelDetailsContent(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Subscriber metric + upload email
+            // Subscriber metric. PRIVACY: the creator's email is never shown.
             Text(
                 text = "${formatSubscriberCount(channel.subscriberCount)} • ${channel.videos.size} ${if (channel.videos.size == 1) "video" else "videos"}",
                 fontSize = 13.sp,
                 color = Color(0xFFA0A0A0)
-            )
-
-            Text(
-                text = "Contact: ${channel.uploaderEmail}",
-                fontSize = 11.sp,
-                color = Color(0xFF6F6F6F),
-                modifier = Modifier.padding(top = 4.dp)
             )
 
             Spacer(modifier = Modifier.height(20.dp))

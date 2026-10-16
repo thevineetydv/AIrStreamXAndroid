@@ -23,6 +23,12 @@ interface VideoDao {
     @Query("SELECT * FROM videos WHERE publicId = :publicId LIMIT 1")
     suspend fun getVideoByPublicId(publicId: String): VideoEntity?
 
+    @Query("SELECT * FROM videos WHERE publicId IN (:publicIds)")
+    suspend fun getVideosByPublicIds(publicIds: List<String>): List<VideoEntity>
+
+    @Query("SELECT * FROM videos WHERE handle = :handle COLLATE NOCASE ORDER BY id DESC")
+    suspend fun getVideosByHandle(handle: String): List<VideoEntity>
+
     @Query("UPDATE videos SET isLiked = :isLiked, likes = :likes WHERE publicId = :publicId")
     suspend fun updateLikeState(publicId: String, isLiked: Boolean, likes: Int)
 
