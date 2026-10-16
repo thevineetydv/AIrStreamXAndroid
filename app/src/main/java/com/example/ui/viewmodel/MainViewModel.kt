@@ -1,26 +1,45 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.example.data.database.SearchHistoryEntity
 import com.example.data.database.SubscriptionEntity
 import com.example.data.database.WatchHistoryEntity
-import com.example.data.database.SearchHistoryEntity
 import com.example.data.network.ChannelInfo
 import com.example.data.network.Video
 import com.example.data.repository.AuthRepository
 import com.example.data.repository.LocalUser
+import com.example.data.repository.VideoNotFoundException
 import com.example.data.repository.VideoRepository
 import com.example.player.MiniPlayerManager
-import kotlinx.coroutines.delay
+import com.example.upload.UploadWorker
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import java.io.IOException
 
 sealed interface FeedUiState {
     object Loading : FeedUiState
-    data class Success(val videos: List<Video>) : FeedUiState
+    data class Success(
+        val videos: List<Video>,
+        val hasMore: Boolean = false,
+        val isLoadingMore: Boolean = false,
+        /** Set when loading the NEXT page failed; the list stays visible with a Retry row. */
+        val loadMoreError: String? = null
+    ) : FeedUiState
     data class Error(val message: String) : FeedUiState
+}
+
+sealed interface ShortsUiState {
+    object Loading : ShortsUiState
+    data class Success(val videos: List<Video>) : ShortsUiState
+    data class Error(val message: String) : ShortsUiState
 }
 
 sealed interface ChannelUiState {
@@ -30,34 +49,46 @@ sealed interface ChannelUiState {
     data class Error(val message: String) : ChannelUiState
 }
 
+/** Problems with the video currently open in the player. */
+sealed interface ActiveVideoError {
+    object NotFound : ActiveVideoError
+    data class LoadFailed(val message: String) : ActiveVideoError
+}
+
+sealed interface UploadUiState {
+    object Idle : UploadUiState
+    data class Uploading(val percent: Int) : UploadUiState
+    data class Success(val publicId: String?) : UploadUiState
+    data class Failed(val message: String) : UploadUiState
+}
+
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val videoRepository = VideoRepository(application)
     private val authRepository = AuthRepository(application)
+    private val workManager = WorkManager.getInstance(application)
 
     // Auth state flow
     val currentUser: StateFlow<LocalUser?> = authRepository.currentUser
 
-    // Home feed flow
+    // ── Home feed (paged) ───────────────────────────────────────────────────
     private val _feedState = MutableStateFlow<FeedUiState>(FeedUiState.Loading)
     val feedState: StateFlow<FeedUiState> = _feedState
 
-    // Separate home and shorts variables
-    private val _homeVideos = MutableStateFlow<List<Video>>(emptyList())
-    val homeVideos: StateFlow<List<Video>> = _homeVideos
+    private var nextOffset = 0
+    private var feedJob: Job? = null
 
     // Available categories
-    private val _categories = MutableStateFlow<List<String>>(listOf("All", "Music", "Comedy", "Bhakti", "Cricket"))
+    private val _categories = MutableStateFlow(listOf("All", "Music", "Comedy", "Bhakti", "Cricket"))
     val categories: StateFlow<List<String>> = _categories.asStateFlow()
 
     // Available database channels flow
     private val _availableChannels = MutableStateFlow<List<ChannelInfo>>(emptyList())
     val availableChannels: StateFlow<List<ChannelInfo>> = _availableChannels
 
-    // Shorts feed flow
-    private val _shortsVideos = MutableStateFlow<List<Video>>(emptyList())
-    val shortsVideos: StateFlow<List<Video>> = _shortsVideos
+    // ── Shorts ──────────────────────────────────────────────────────────────
+    private val _shortsState = MutableStateFlow<ShortsUiState>(ShortsUiState.Loading)
+    val shortsState: StateFlow<ShortsUiState> = _shortsState
 
-    // Shorts navigation/state
     private val _selectedShortVideo = MutableStateFlow<Video?>(null)
     val selectedShortVideo: StateFlow<Video?> = _selectedShortVideo
 
@@ -65,9 +96,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _selectedShortVideo.value = video
     }
 
-    // Selected video playing
+    // ── Player ──────────────────────────────────────────────────────────────
     private val _currentActiveVideo = MutableStateFlow<Video?>(null)
     val currentActiveVideo: StateFlow<Video?> = _currentActiveVideo
+
+    private val _activeVideoError = MutableStateFlow<ActiveVideoError?>(null)
+    val activeVideoError: StateFlow<ActiveVideoError?> = _activeVideoError
+
+    private var activeVideoJob: Job? = null
 
     // Channel page detail state
     private val _channelState = MutableStateFlow<ChannelUiState>(ChannelUiState.Idle)
@@ -90,77 +126,163 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val searchHistory: StateFlow<List<SearchHistoryEntity>> = videoRepository.searchHistory
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    // ── Upload ──────────────────────────────────────────────────────────────
+    private val _uploadState = MutableStateFlow<UploadUiState>(UploadUiState.Idle)
+    val uploadState: StateFlow<UploadUiState> = _uploadState
+    private var uploadObserverJob: Job? = null
+
     fun insertSearchQuery(query: String) {
-        viewModelScope.launch {
-            videoRepository.insertSearchQuery(query)
-        }
+        viewModelScope.launch { videoRepository.insertSearchQuery(query) }
     }
 
     fun deleteSearchQuery(query: String) {
-        viewModelScope.launch {
-            videoRepository.deleteSearchQuery(query)
-        }
+        viewModelScope.launch { videoRepository.deleteSearchQuery(query) }
     }
 
     init {
         loadHomeFeed()
+        loadShorts()
+        observeExistingUpload()
     }
 
+    /**
+     * Loads page 1 of the long-video feed.
+     *
+     * A first page fetched in the last 5 minutes is shown straight from the
+     * in-memory cache. On failure with nothing on screen the UI gets an Error
+     * state (with Retry) — never an empty "No videos" list.
+     */
     fun loadHomeFeed(forceRefresh: Boolean = false) {
-        viewModelScope.launch {
-            val hasCachedData = _homeVideos.value.isNotEmpty()
-            if (!hasCachedData || forceRefresh) {
-                _feedState.value = FeedUiState.Loading
+        feedJob?.cancel()
+        feedJob = viewModelScope.launch {
+            if (forceRefresh) videoRepository.invalidateCache()
+
+            val cached = videoRepository.cachedFirstPage()
+            if (cached != null) {
+                nextOffset = cached.nextOffset
+                _feedState.value = FeedUiState.Success(cached.videos, hasMore = cached.hasMore)
+                _availableChannels.value = videoRepository.getDistinctChannels()
+                return@launch
             }
-            if (forceRefresh) {
-                videoRepository.invalidateCache()
-            }
+
+            val showing = _feedState.value as? FeedUiState.Success
+            if (showing == null || forceRefresh) _feedState.value = FeedUiState.Loading
+
             try {
-                val homeList = videoRepository.getNormalVideos()
-                val shortsList = videoRepository.getShortsVideos()
-                val channelsList = videoRepository.getDistinctChannels()
-                
-                _homeVideos.value = homeList
-                _shortsVideos.value = shortsList.filter { it.duration <= 60.0 }
-                _availableChannels.value = channelsList
-                _feedState.value = FeedUiState.Success(homeList)
+                val page = videoRepository.getHomeFeedPage(offset = 0)
+                nextOffset = page.nextOffset
+                _feedState.value = FeedUiState.Success(page.videos, hasMore = page.hasMore)
+                _availableChannels.value = videoRepository.getDistinctChannels()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.e("MainViewModel", "Error loading feed", e)
-                if (!hasCachedData || forceRefresh) {
-                    _feedState.value = FeedUiState.Error(e.message ?: "Failed loading home feed")
+                Log.e(TAG, "Home feed failed: ${e.javaClass.simpleName}")
+                // Keep what's already on screen if this was a background refresh.
+                if (showing == null || forceRefresh) {
+                    _feedState.value = FeedUiState.Error(friendlyError(e))
                 }
             }
         }
     }
 
-    fun selectVideo(video: Video) {
-        _currentActiveVideo.value = video
-        viewModelScope.launch {
-            videoRepository.addToWatchHistory(video)
+    /** Infinite scroll: fetches the next page and appends it, de-duplicated by public_id. */
+    fun loadMoreHomeFeed() {
+        val current = _feedState.value as? FeedUiState.Success ?: return
+        if (!current.hasMore || current.isLoadingMore || feedJob?.isActive == true) return
+
+        feedJob = viewModelScope.launch {
+            _feedState.value = current.copy(isLoadingMore = true, loadMoreError = null)
+            try {
+                val page = videoRepository.getHomeFeedPage(offset = nextOffset)
+                nextOffset = page.nextOffset
+                val latest = _feedState.value as? FeedUiState.Success ?: current
+                val seen = latest.videos.mapTo(HashSet()) { it.publicId }
+                _feedState.value = latest.copy(
+                    videos = latest.videos + page.videos.filter { seen.add(it.publicId) },
+                    hasMore = page.hasMore,
+                    isLoadingMore = false
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Loading more failed: ${e.javaClass.simpleName}")
+                val latest = _feedState.value as? FeedUiState.Success ?: current
+                _feedState.value = latest.copy(isLoadingMore = false, loadMoreError = friendlyError(e))
+            }
         }
     }
 
-    fun selectVideoById(publicId: String) {
+    fun loadShorts() {
         viewModelScope.launch {
-            try {
-                val video = videoRepository.getVideo(publicId)
-                _currentActiveVideo.value = video
-                videoRepository.addToWatchHistory(video)
+            if (_shortsState.value !is ShortsUiState.Success) _shortsState.value = ShortsUiState.Loading
+            _shortsState.value = try {
+                ShortsUiState.Success(videoRepository.getShorts())
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.e("MainViewModel", "Error selecting video $publicId", e)
+                Log.e(TAG, "Shorts failed: ${e.javaClass.simpleName}")
+                (_shortsState.value as? ShortsUiState.Success) ?: ShortsUiState.Error(friendlyError(e))
             }
         }
+    }
+
+    /**
+     * Shows the clicked video immediately (thumbnail, title, and its stream URL so
+     * playback can start), then loads the full record from GET /videos/{public_id}
+     * and patches it in. The player isn't restarted by the refresh: it only
+     * reloads when the stream URL actually changes.
+     */
+    fun selectVideo(video: Video) {
+        _currentActiveVideo.value = video
+        loadActiveVideo(video.publicId, alreadyShowing = true)
+    }
+
+    /** Opens a video we only know the id of (watch history, deep links later). */
+    fun selectVideoById(publicId: String) {
+        _currentActiveVideo.value = null
+        loadActiveVideo(publicId, alreadyShowing = false)
+    }
+
+    private var lastRequestedVideoId: String? = null
+
+    private fun loadActiveVideo(publicId: String, alreadyShowing: Boolean) {
+        lastRequestedVideoId = publicId
+        _activeVideoError.value = null
+        activeVideoJob?.cancel()
+        activeVideoJob = viewModelScope.launch {
+            try {
+                val full = videoRepository.getVideo(publicId)
+                if (_currentActiveVideo.value?.publicId == publicId || !alreadyShowing) {
+                    _currentActiveVideo.value = full
+                }
+                videoRepository.addToWatchHistory(full)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: VideoNotFoundException) {
+                _activeVideoError.value = ActiveVideoError.NotFound
+            } catch (e: Exception) {
+                Log.e(TAG, "Loading video failed: ${e.javaClass.simpleName}")
+                // If the clicked item is already on screen, keep it (offline,
+                // flaky network); otherwise there's nothing to show.
+                if (!alreadyShowing) _activeVideoError.value = ActiveVideoError.LoadFailed(friendlyError(e))
+            }
+        }
+    }
+
+    fun retryActiveVideo() {
+        val id = lastRequestedVideoId ?: return
+        loadActiveVideo(id, alreadyShowing = _currentActiveVideo.value?.publicId == id)
     }
 
     fun loadChannel(handle: String) {
         viewModelScope.launch {
             _channelState.value = ChannelUiState.Loading
-            try {
-                delay(300) // add smooth loading transitions
-                val info = videoRepository.getChannelInfo(handle)
-                _channelState.value = ChannelUiState.Success(info)
+            _channelState.value = try {
+                ChannelUiState.Success(videoRepository.getChannelInfo(handle))
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                _channelState.value = ChannelUiState.Error(e.message ?: "Failed to load channel info")
+                ChannelUiState.Error(friendlyError(e))
             }
         }
     }
@@ -172,49 +294,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
-            // debouncing search query slightly is nice but direct load is responsive
-            val results = videoRepository.searchVideos(query)
-            _searchResults.value = results
+            _searchResults.value = videoRepository.searchVideos(query)
         }
     }
 
-    // PERF FIX: this used to call loadHomeFeed() after every toggle, which
-    // fired getNormalVideos() + getShortsVideos() + getDistinctChannels() —
-    // up to 3 redundant network/DB round trips just to reflect one video's
-    // new subscription state — and (since the 5-minute metadata cache wasn't
-    // invalidated) usually didn't even show the change, since it kept
-    // serving the stale cached list underneath. We now patch just the
-    // affected video's state in place and refresh only the channel list
-    // (a cheap local DB read, needed because subscriber counts changed).
     fun toggleSubscription(video: Video) {
         viewModelScope.launch {
             videoRepository.toggleSubscription(video)
-            try {
-                val updated = videoRepository.getVideo(video.publicId)
-                patchVideoEverywhere(updated)
-                _availableChannels.value = videoRepository.getDistinctChannels()
-            } catch (e: Exception) {
-                Log.e("MainViewModel", "Error reloading active video", e)
-            }
+            _availableChannels.value = videoRepository.getDistinctChannels()
         }
     }
 
-    // PERF FIX: patches one video's fresh state into every StateFlow that
-    // holds a copy of it (active video, home list, shorts list, current feed
-    // page) plus the in-memory metadata cache — replacing the old pattern of
-    // calling loadHomeFeed() (a full network+DB reload) just to reflect a
-    // single like/dislike/subscribe change.
+    /** Patches one video's fresh state into every flow that holds a copy of it. */
     private fun patchVideoEverywhere(updated: Video) {
-        if (_currentActiveVideo.value?.publicId == updated.publicId) {
-            _currentActiveVideo.value = updated
+        _currentActiveVideo.value?.let { active ->
+            if (active.publicId == updated.publicId) {
+                // Room only stores some fields; keep server-only ones (status, upi, …).
+                _currentActiveVideo.value = active.copy(
+                    likes = updated.likes, dislikes = updated.dislikes,
+                    isLiked = updated.isLiked, isDisliked = updated.isDisliked
+                )
+            }
         }
-        _homeVideos.update { list -> list.map { if (it.publicId == updated.publicId) updated else it } }
-        _shortsVideos.update { list -> list.map { if (it.publicId == updated.publicId) updated else it } }
-        val current = _feedState.value
-        if (current is FeedUiState.Success) {
-            _feedState.value = FeedUiState.Success(
-                current.videos.map { if (it.publicId == updated.publicId) updated else it }
-            )
+        fun List<Video>.patched() = map {
+            if (it.publicId == updated.publicId) it.copy(
+                likes = updated.likes, dislikes = updated.dislikes,
+                isLiked = updated.isLiked, isDisliked = updated.isDisliked
+            ) else it
+        }
+        (_shortsState.value as? ShortsUiState.Success)?.let {
+            _shortsState.value = ShortsUiState.Success(it.videos.patched())
+        }
+        (_feedState.value as? FeedUiState.Success)?.let {
+            _feedState.value = it.copy(videos = it.videos.patched())
         }
         videoRepository.patchCachedVideo(updated)
     }
@@ -223,17 +335,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             videoRepository.toggleSubscriptionByChannel(channel)
             loadChannel(channel.handle)
-            loadHomeFeed()
+            _availableChannels.value = videoRepository.getDistinctChannels()
         }
     }
 
     fun toggleLikeVideo(video: Video) {
         viewModelScope.launch {
             try {
-                val updated = videoRepository.toggleLikeVideo(video.publicId)
-                if (updated != null) patchVideoEverywhere(updated)
+                videoRepository.toggleLikeVideo(video.publicId)?.let { patchVideoEverywhere(it) }
             } catch (e: Exception) {
-                Log.e("MainViewModel", "Error toggling like", e)
+                Log.e(TAG, "Error toggling like", e)
             }
         }
     }
@@ -241,25 +352,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleDislikeVideo(video: Video) {
         viewModelScope.launch {
             try {
-                val updated = videoRepository.toggleDislikeVideo(video.publicId)
-                if (updated != null) patchVideoEverywhere(updated)
+                videoRepository.toggleDislikeVideo(video.publicId)?.let { patchVideoEverywhere(it) }
             } catch (e: Exception) {
-                Log.e("MainViewModel", "Error toggling dislike", e)
+                Log.e(TAG, "Error toggling dislike", e)
             }
         }
     }
 
     fun isSubscribed(handle: String): Flow<Boolean> {
-        val cleanHandle = handle.removePrefix("@")
-        return videoRepository.isSubscribedLocally(cleanHandle)
+        return videoRepository.isSubscribedLocally(handle.removePrefix("@"))
     }
-
-    // NOTE: removed getChannelSubscriberCount(handle) — it fired a full
-    // getChannelInfo() network call every time VideoPlayerScreen opened a
-    // video or its subscription state changed, just to read a number that
-    // was already sitting on Video.subscriberCount (kept in sync locally by
-    // adjustChannelSubscriberCountInDb). VideoPlayerScreen now reads
-    // video.subscriberCount directly — see PERF FIX comment there.
 
     fun signIn(email: String, displayName: String?, pass: String, isSignUp: Boolean, onSuccess: () -> Unit, onError: (String) -> Unit) {
         viewModelScope.launch {
@@ -268,33 +370,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 authRepository.signInWithEmail(email, pass)
             }
-            if (result.isSuccess) {
-                onSuccess()
-            } else {
-                onError(result.exceptionOrNull()?.message ?: "Authentication failed")
-            }
+            if (result.isSuccess) onSuccess()
+            else onError(result.exceptionOrNull()?.message ?: "Authentication failed")
         }
     }
 
-    fun signInWithGoogle(idToken: String?, email: String, displayName: String?, photoUrl: String?, onSuccess: () -> Unit, onError: (String) -> Unit) {
+    fun signInWithGoogle(idToken: String?, onSuccess: () -> Unit, onError: (String) -> Unit) {
         viewModelScope.launch {
-            val result = authRepository.signInWithGoogle(idToken, email, displayName, photoUrl)
-            if (result.isSuccess) {
-                onSuccess()
-            } else {
-                onError(result.exceptionOrNull()?.message ?: "Google Authentication failed")
-            }
+            val result = authRepository.signInWithGoogle(idToken)
+            if (result.isSuccess) onSuccess()
+            else onError(result.exceptionOrNull()?.message ?: "Google Authentication failed")
         }
     }
 
     fun signInAnonymously(onSuccess: () -> Unit, onError: (String) -> Unit) {
         viewModelScope.launch {
             val result = authRepository.signInAnonymously()
-            if (result.isSuccess) {
-                onSuccess()
-            } else {
-                onError(result.exceptionOrNull()?.message ?: "Anonymous Authentication failed")
-            }
+            if (result.isSuccess) onSuccess()
+            else onError(result.exceptionOrNull()?.message ?: "Anonymous Authentication failed")
         }
     }
 
@@ -310,33 +403,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _showSignInPrompt.value = false
     }
 
-    // FIX: A null/absent user (never signed in) must be treated as a guest —
-    // previously this returned false for that case, which meant an
-    // unauthenticated user could fall through the isGuest() gate on like/
-    // dislike/subscribe/comment actions instead of seeing the sign-in
-    // prompt, and would then hit an authenticated-only backend call and fail.
+    /** A null user or a Firebase anonymous session is a guest. */
     fun isGuest(): Boolean {
-        val user = currentUser.value ?: return true
-        return user.email == "guest@airstreamx.com" || authRepository.isFirebaseAnonymous()
+        currentUser.value ?: return true
+        return authRepository.isFirebaseAnonymous()
     }
 
     fun clearHistory() {
+        viewModelScope.launch { videoRepository.clearHistory() }
+    }
+
+    // ── Upload ──────────────────────────────────────────────────────────────
+
+    /**
+     * Hands the upload to WorkManager (foreground, survives the app being closed)
+     * and tracks its real progress. Nothing is saved locally and nothing is
+     * reported as published until the server confirms it.
+     */
+    fun startUpload(fileUri: Uri, title: String, category: String, durationSeconds: Double) {
+        val id = UploadWorker.enqueue(getApplication<Application>(), fileUri, title, category, durationSeconds)
+        _uploadState.value = UploadUiState.Uploading(0)
+        observeUpload(id)
+    }
+
+    fun cancelUpload() {
+        UploadWorker.cancel(getApplication<Application>())
+    }
+
+    fun resetUploadState() {
+        _uploadState.value = UploadUiState.Idle
+    }
+
+    /** Re-attaches to an upload that was still running when the app was closed. */
+    private fun observeExistingUpload() {
         viewModelScope.launch {
-            videoRepository.clearHistory()
+            try {
+                val running = workManager.getWorkInfosForUniqueWorkFlow(UploadWorker.UNIQUE_NAME)
+                    .first()
+                    .firstOrNull { !it.state.isFinished }
+                if (running != null) observeUpload(running.id)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not check for a running upload: ${e.javaClass.simpleName}")
+            }
         }
     }
 
-    fun uploadVideo(video: Video, localUriString: String? = null, onComplete: () -> Unit) {
-        viewModelScope.launch {
-            val token = authRepository.getFirebaseToken()
-            videoRepository.uploadVideo(video, localUriString, token)
-            loadHomeFeed()
-            onComplete()
+    private fun observeUpload(id: java.util.UUID) {
+        uploadObserverJob?.cancel()
+        uploadObserverJob = viewModelScope.launch {
+            workManager.getWorkInfoByIdFlow(id).filterNotNull().collect { info ->
+                _uploadState.value = when (info.state) {
+                    WorkInfo.State.SUCCEEDED -> {
+                        loadHomeFeed(forceRefresh = true)
+                        UploadUiState.Success(info.outputData.getString(UploadWorker.KEY_PUBLIC_ID))
+                    }
+                    WorkInfo.State.FAILED -> UploadUiState.Failed(
+                        info.outputData.getString(UploadWorker.KEY_ERROR) ?: "Upload failed. Please try again."
+                    )
+                    WorkInfo.State.CANCELLED -> UploadUiState.Failed("Upload cancelled.")
+                    else -> UploadUiState.Uploading(info.progress.getInt(UploadWorker.KEY_PROGRESS, 0))
+                }
+            }
         }
     }
 
     fun clearActiveVideo() {
+        activeVideoJob?.cancel()
         _currentActiveVideo.value = null
+        _activeVideoError.value = null
         _selectedShortVideo.value = null
     }
 
@@ -344,5 +478,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         MiniPlayerManager.releasePlayer()
         clearActiveVideo()
         authRepository.logout()
+    }
+
+    override fun onCleared() {
+        authRepository.close()
+        super.onCleared()
+    }
+
+    private fun friendlyError(e: Exception): String = when (e) {
+        is IOException -> "You're offline or the connection is slow. Check your internet and try again."
+        is retrofit2.HttpException -> "Server error (${e.code()}). Please try again."
+        else -> "Something went wrong. Please try again."
+    }
+
+    companion object {
+        private const val TAG = "MainViewModel"
     }
 }

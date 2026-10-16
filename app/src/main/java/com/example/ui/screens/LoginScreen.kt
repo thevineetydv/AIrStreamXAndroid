@@ -100,18 +100,12 @@ fun LoginScreen(
         try {
             val account = task.getResult(ApiException::class.java)
             if (account != null) {
-                val userEmail = account.email ?: ""
-                val userName = account.displayName ?: userEmail.substringBefore("@")
-                val photoUrl = account.photoUrl?.toString()
-                val idToken = account.idToken
-
                 MiniPlayerManager.releasePlayer()
                 viewModel.clearActiveVideo()
+                // Identity comes from Firebase verifying the Google ID token — never
+                // from the email/name the Google client hands back.
                 viewModel.signInWithGoogle(
-                    idToken = idToken,
-                    email = userEmail,
-                    displayName = userName,
-                    photoUrl = photoUrl,
+                    idToken = account.idToken,
                     onSuccess = {
                         isLoading = false
                         onLoginSuccess()

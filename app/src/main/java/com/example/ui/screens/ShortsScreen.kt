@@ -38,6 +38,8 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.example.data.network.Video
 import com.example.ui.viewmodel.MainViewModel
+import com.example.ui.viewmodel.ShortsUiState
+import androidx.compose.ui.text.style.TextAlign
 import androidx.media3.ui.AspectRatioFrameLayout
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -47,18 +49,27 @@ fun ShortsScreen(
     onChannelClick: (String) -> Unit,
     onBackClick: (() -> Unit)? = null
 ) {
-    val shortsVideos by viewModel.shortsVideos.collectAsState()
+    val shortsState by viewModel.shortsState.collectAsState()
     val selectedShortVideo by viewModel.selectedShortVideo.collectAsState()
 
-    if (shortsVideos.isEmpty()) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color(0xFF0A0A0A)),
-            contentAlignment = Alignment.Center
-        ) {
-            CircularProgressIndicator(color = Color(0xFFDC2626))
+    // Loading / error / empty each get their own screen — previously an empty
+    // list (including a failed request) showed a spinner forever.
+    val shortsVideos = when (val s = shortsState) {
+        is ShortsUiState.Success -> s.videos
+        is ShortsUiState.Loading -> {
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color(0xFF0A0A0A)),
+                contentAlignment = Alignment.Center
+            ) { CircularProgressIndicator(color = Color(0xFFDC2626)) }
+            return
         }
+        is ShortsUiState.Error -> {
+            ShortsMessage(message = s.message, onRetry = { viewModel.loadShorts() })
+            return
+        }
+    }
+    if (shortsVideos.isEmpty()) {
+        ShortsMessage(message = "No Shorts yet. Check back soon!", onRetry = { viewModel.loadShorts() })
         return
     }
 
@@ -136,6 +147,22 @@ fun ShortsScreen(
                 color = Color.White
             )
         }
+    }
+}
+
+@Composable
+private fun ShortsMessage(message: String, onRetry: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().background(Color(0xFF0A0A0A)).padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(message, color = Color.White, fontSize = 14.sp, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = onRetry,
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5A5F))
+        ) { Text("Retry", color = Color.White) }
     }
 }
 
@@ -218,13 +245,12 @@ fun ShortsPageItem(
     nextVideoUrl: String? = null
 ) {
     val context = LocalContext.current
-    val mockComments = remember(video.publicId) { (video.views / 80).coerceAtLeast(12) }
 
     Box(
         modifier = Modifier.fillMaxSize()
     ) {
         // Full screen video player
-        if (isFocused) {
+        if (isFocused && video.isPlayable()) {
             HlsVideoPlayer(
                 videoUrl = video.url,
                 modifier = Modifier.fillMaxSize(),
@@ -350,7 +376,8 @@ fun ShortsPageItem(
                     )
                 }
                 Text(
-                    text = formatViews(mockComments),
+                    // Real comment counts arrive with the comments feature; no invented numbers.
+                    text = "Comments",
                     color = Color.White,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
@@ -362,7 +389,11 @@ fun ShortsPageItem(
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 IconButton(
                     onClick = {
-                        Toast.makeText(context, "Link copied to share!", Toast.LENGTH_SHORT).show()
+                        val share = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(android.content.Intent.EXTRA_TEXT, "Watch \"${video.title}\" on AirStreamX: ${video.shareUrl()}")
+                        }
+                        context.startActivity(android.content.Intent.createChooser(share, "Share via"))
                     },
                     modifier = Modifier
                         .size(44.dp)
