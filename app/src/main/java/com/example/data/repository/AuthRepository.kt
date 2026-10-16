@@ -4,6 +4,8 @@ import android.content.Context
 import android.util.Log
 import com.example.data.database.AppDatabase
 import com.google.firebase.FirebaseApp
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.GoogleAuthProvider
@@ -24,8 +26,12 @@ import kotlin.coroutines.resumeWithException
 data class LocalUser(
     val email: String,
     val displayName: String,
-    val avatarUrl: String = ""
+    val avatarUrl: String = "",
+    /** Browse-only guest: no account, no token, every protected action asks to sign in. */
+    val isGuest: Boolean = false
 )
+
+private val GUEST_USER = LocalUser(email = "", displayName = "Guest", isGuest = true)
 
 /** Thrown when the build has no usable Firebase config (google-services.json). */
 class AuthUnavailableException :
@@ -49,7 +55,24 @@ class AuthRepository(private val context: Context) {
         null
     }
 
-    private val _currentUser = MutableStateFlow(firebaseAuth?.currentUser?.toLocalUser())
+    // Guest browsing is a local "no account" mode, NOT Firebase anonymous auth:
+    // anonymous auth fails with "This operation is restricted to administrators
+    // only" unless the Anonymous provider is enabled in the Firebase console, and
+    // a guest needs no identity anyway (the feed and playback are public).
+    // A guest never gets a token and can't claim any identity, so this isn't an
+    // auth bypass.
+    private val guestPrefs = context.getSharedPreferences(GUEST_PREFS, Context.MODE_PRIVATE)
+    private var guestMode: Boolean
+        get() = guestPrefs.getBoolean(KEY_GUEST, false)
+        set(value) { guestPrefs.edit().putBoolean(KEY_GUEST, value).apply() }
+
+    private fun resolveUser(fbUser: FirebaseUser?): LocalUser? = when {
+        fbUser != null && !fbUser.isAnonymous -> fbUser.toLocalUser()
+        guestMode -> GUEST_USER
+        else -> null
+    }
+
+    private val _currentUser = MutableStateFlow(resolveUser(firebaseAuth?.currentUser))
     val currentUser: StateFlow<LocalUser?> = _currentUser
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -57,10 +80,13 @@ class AuthRepository(private val context: Context) {
     // Keeps currentUser in sync with Firebase (sign-in, sign-out, account deletion,
     // token revocation).
     private val authListener = FirebaseAuth.AuthStateListener { auth ->
-        _currentUser.value = auth.currentUser?.toLocalUser()
+        _currentUser.value = resolveUser(auth.currentUser)
     }
 
     init {
+        // Sessions from the old Firebase-anonymous guest flow are dropped; guests
+        // are now account-less (see guestMode).
+        if (firebaseAuth?.currentUser?.isAnonymous == true) firebaseAuth?.signOut()
         firebaseAuth?.addAuthStateListener(authListener)
         if (firebaseAuth == null) {
             Log.e(TAG, "Firebase is not configured — add app/google-services.json. Sign-in is disabled.")
@@ -95,10 +121,11 @@ class AuthRepository(private val context: Context) {
             val credential = GoogleAuthProvider.getCredential(idToken, null)
             val user = auth.signInWithCredential(credential).await().user
                 ?: return Result.failure(IllegalStateException("Google sign-in failed."))
+            guestMode = false
             Result.success(user.toLocalUser().also { _currentUser.value = it })
         } catch (e: Exception) {
-            Log.e(TAG, "Google credential sign-in failed: ${e.javaClass.simpleName}")
-            Result.failure(e)
+            Log.e(TAG, "Google credential sign-in failed: ${errorCode(e)}")
+            Result.failure(friendly(e))
         }
     }
 
@@ -107,10 +134,11 @@ class AuthRepository(private val context: Context) {
         return try {
             val user = auth.signInWithEmailAndPassword(email, password).await().user
                 ?: return Result.failure(IllegalStateException("Sign-in failed."))
+            guestMode = false
             Result.success(user.toLocalUser().also { _currentUser.value = it })
         } catch (e: Exception) {
-            Log.e(TAG, "Email sign-in failed: ${e.javaClass.simpleName}")
-            Result.failure(e)
+            Log.e(TAG, "Email sign-in failed: ${errorCode(e)}")
+            Result.failure(friendly(e))
         }
     }
 
@@ -120,46 +148,53 @@ class AuthRepository(private val context: Context) {
             val user = auth.createUserWithEmailAndPassword(email, password).await().user
                 ?: return Result.failure(IllegalStateException("Sign-up failed."))
             user.updateProfile(userProfileChangeRequest { this.displayName = displayName }).await()
+            guestMode = false
             Result.success(user.toLocalUser().copy(displayName = displayName).also { _currentUser.value = it })
         } catch (e: Exception) {
-            Log.e(TAG, "Email sign-up failed: ${e.javaClass.simpleName}")
-            Result.failure(e)
+            Log.e(TAG, "Email sign-up failed: ${errorCode(e)}")
+            Result.failure(friendly(e))
         }
     }
 
-    /** Browse-only guest session via Firebase anonymous auth. No local fallback. */
-    suspend fun signInAnonymously(): Result<LocalUser> {
-        val auth = firebaseAuth ?: return Result.failure(AuthUnavailableException())
-        return try {
-            val user = auth.signInAnonymously().await().user
-                ?: return Result.failure(IllegalStateException("Guest sign-in failed."))
-            Result.success(user.toLocalUser().also { _currentUser.value = it })
-        } catch (e: Exception) {
-            Log.e(TAG, "Anonymous sign-in failed: ${e.javaClass.simpleName}")
-            Result.failure(e)
-        }
+    /** Browse without an account. Works even when Firebase isn't configured. */
+    fun continueAsGuest(): LocalUser {
+        guestMode = true
+        _currentUser.value = GUEST_USER
+        return GUEST_USER
     }
 
-    fun isFirebaseAnonymous(): Boolean = firebaseAuth?.currentUser?.isAnonymous == true
+    fun isGuest(): Boolean = _currentUser.value?.isGuest ?: true
 
     fun logout() {
-        val auth = firebaseAuth
-        val user = auth?.currentUser
-        if (user != null && user.isAnonymous) {
-            // Remove throwaway guest accounts so they don't pile up in Firebase.
-            ioScope.launch {
-                try {
-                    user.delete().await()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Could not delete guest account: ${e.javaClass.simpleName}")
-                }
-                auth?.signOut()
-            }
-        } else {
-            auth?.signOut()
-        }
+        firebaseAuth?.signOut()
+        guestMode = false
         _currentUser.value = null
         ioScope.launch { clearLegacyLocalSession() }
+    }
+
+    private fun errorCode(e: Exception): String =
+        (e as? FirebaseAuthException)?.errorCode ?: e.javaClass.simpleName
+
+    /** Turns Firebase error codes into messages a user can act on. */
+    private fun friendly(e: Exception): Exception {
+        if (e is FirebaseNetworkException) {
+            return Exception("No internet connection. Check your network and try again.")
+        }
+        val msg = when (errorCode(e)) {
+            "ERROR_OPERATION_NOT_ALLOWED", "ADMIN_ONLY_OPERATION", "ERROR_ADMIN_RESTRICTED_OPERATION" ->
+                "Email sign-in isn't available yet. Please use Continue with Google."
+            "ERROR_INVALID_EMAIL" -> "That email address doesn't look right."
+            "ERROR_WRONG_PASSWORD", "ERROR_USER_NOT_FOUND", "ERROR_INVALID_CREDENTIAL", "INVALID_LOGIN_CREDENTIALS" ->
+                "Wrong email or password."
+            "ERROR_USER_DISABLED" -> "This account has been disabled."
+            "ERROR_EMAIL_ALREADY_IN_USE" -> "An account with this email already exists. Try signing in."
+            "ERROR_WEAK_PASSWORD" -> "Please choose a stronger password (at least 6 characters)."
+            "ERROR_TOO_MANY_REQUESTS" -> "Too many attempts. Please wait a few minutes and try again."
+            "ERROR_ACCOUNT_EXISTS_WITH_DIFFERENT_CREDENTIAL" ->
+                "This email is already linked to another sign-in method. Try Continue with Google."
+            else -> e.message ?: "Sign-in failed. Please try again."
+        }
+        return Exception(msg, e)
     }
 
     private suspend fun clearLegacyLocalSession() {
@@ -181,6 +216,8 @@ class AuthRepository(private val context: Context) {
     companion object {
         private const val TAG = "AuthRepository"
         private const val LEGACY_PREFS = "airstreamx_auth"
+        private const val GUEST_PREFS = "airstreamx_guest"
+        private const val KEY_GUEST = "guest_mode"
     }
 }
 

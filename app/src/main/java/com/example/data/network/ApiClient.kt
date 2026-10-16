@@ -30,7 +30,7 @@ object ApiClient {
      */
     fun currentIdTokenBlocking(): String? = try {
         val user = FirebaseAuth.getInstance().currentUser
-        if (user == null) null
+        if (user == null || user.isAnonymous) null
         else Tasks.await(user.getIdToken(false), 10, TimeUnit.SECONDS).token
     } catch (e: IllegalStateException) {
         null // Firebase not initialised (no google-services.json)

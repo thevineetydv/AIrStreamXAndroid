@@ -383,12 +383,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Browse-only guest — no account needed, works offline from Firebase config. */
     fun signInAnonymously(onSuccess: () -> Unit, onError: (String) -> Unit) {
-        viewModelScope.launch {
-            val result = authRepository.signInAnonymously()
-            if (result.isSuccess) onSuccess()
-            else onError(result.exceptionOrNull()?.message ?: "Anonymous Authentication failed")
-        }
+        authRepository.continueAsGuest()
+        onSuccess()
     }
 
     // Bottom Sheet Control
@@ -403,11 +401,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _showSignInPrompt.value = false
     }
 
-    /** A null user or a Firebase anonymous session is a guest. */
-    fun isGuest(): Boolean {
-        currentUser.value ?: return true
-        return authRepository.isFirebaseAnonymous()
-    }
+    /** No user, or browse-only guest mode. */
+    fun isGuest(): Boolean = authRepository.isGuest()
 
     fun clearHistory() {
         viewModelScope.launch { videoRepository.clearHistory() }
